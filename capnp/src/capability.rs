@@ -27,8 +27,10 @@ use {any_pointer, Error, MessageSize};
 use traits::{Pipelined, Owned};
 use private::capability::{ClientHook, ParamsHook, RequestHook, ResponseHook, ResultsHook};
 
-#[cfg(feature = "rpc")]
-use futures::Future;
+use std::future::{Future};
+use std::pin::{Pin};
+use std::marker::Unpin;
+use std::task::Poll;
 #[cfg(feature = "rpc_try")]
 use std::ops::Try;
 
@@ -37,22 +39,17 @@ use std::marker::PhantomData;
 /// A computation that might eventually resolve to a value of type `T` or to an error
 ///  of type `E`. Dropping the promise cancels the computation.
 #[must_use = "futures do nothing unless polled"]
-pub struct Promise<T, E> {
-    #[allow(dead_code)]
+pub struct Promise<T, E>  where T: Unpin, E: Unpin {
     inner: PromiseInner<T, E>,
 }
 
-enum PromiseInner<T, E> {
+enum PromiseInner<T, E> where T: Unpin, E: Unpin {
     Immediate(Result<T,E>),
-
-    #[cfg(feature = "rpc")]
-    Deferred(Box<Future<Item=T,Error=E> + 'static>),
-
-    #[cfg(feature = "rpc")]
+    Deferred(Box<Future<Output=::std::result::Result<T,E>> + 'static + Unpin>),
     Empty,
 }
 
-impl <T, E> Promise<T, E> {
+impl <T, E> Promise<T, E>  where T: Unpin, E: Unpin {
     pub fn ok(value: T) -> Promise<T, E> {
         Promise { inner: PromiseInner::Immediate(Ok(value)) }
     }
@@ -61,31 +58,27 @@ impl <T, E> Promise<T, E> {
         Promise { inner: PromiseInner::Immediate(Err(error)) }
     }
 
-    #[cfg(feature = "rpc")]
     pub fn from_future<F>(f: F) -> Promise<T, E>
-        where F: Future<Item=T,Error=E> + 'static
+        where F: Future<Output=::std::result::Result<T,E>> + 'static + Unpin
     {
         Promise { inner: PromiseInner::Deferred(Box::new(f)) }
     }
 }
 
-#[cfg(feature = "rpc")]
-impl <T, E> Future for Promise<T, E>
+impl <T, E> Future for Promise<T, E>  where T: Unpin, E: Unpin
 {
-    type Item = T;
-    type Error = E;
+    type Output = ::std::result::Result<T,E>;
 
-    fn poll(&mut self) -> ::futures::Poll<Self::Item, Self::Error> {
-        match self.inner {
+    fn poll(self: Pin<&mut Self>, lw: &::std::task::LocalWaker) -> Poll<Self::Output> {
+        match self.get_mut().inner {
             PromiseInner::Empty => panic!("Promise polled after done."),
             ref mut imm @ PromiseInner::Immediate(_) => {
                 match ::std::mem::replace(imm, PromiseInner::Empty) {
-                    PromiseInner::Immediate(Ok(v)) => Ok(::futures::Async::Ready(v)),
-                    PromiseInner::Immediate(Err(e)) => Err(e),
+                    PromiseInner::Immediate(r) => Poll::Ready(r),
                     _ => unreachable!(),
                 }
             }
-            PromiseInner::Deferred(ref mut f) => f.poll(),
+            PromiseInner::Deferred(ref mut f) => Future::poll(Pin::new(f), lw),
         }
     }
 }
@@ -109,7 +102,7 @@ impl<T> Try for Promise<T, crate::Error> {
 
 /// A promise for a result from a method call.
 #[must_use]
-pub struct RemotePromise<Results> where Results: Pipelined + for<'a> Owned<'a> + 'static {
+pub struct RemotePromise<Results> where Results: Pipelined + for<'a> Owned<'a> + 'static + Unpin {
     pub promise: Promise<Response<Results>, ::Error>,
     pub pipeline: Results::Pipeline,
 }
@@ -153,9 +146,9 @@ impl <Params, Results> Request<Params, Results>
     }
 }
 
-#[cfg(feature = "rpc")]
+/*
 impl <Params, Results> Request <Params, Results>
-where Results: Pipelined + for<'a> Owned<'a> + 'static,
+where Results: Pipelined + for<'a> Owned<'a> + 'static + Unpin,
       <Results as Pipelined>::Pipeline: FromTypelessPipeline
 {
     pub fn send(self) -> RemotePromise<Results> {
@@ -169,6 +162,7 @@ where Results: Pipelined + for<'a> Owned<'a> + 'static,
                       }
     }
 }
+*/
 
 /// The values of the parameters passed to a method call, as seen by the server.
 pub struct Params<T> {
